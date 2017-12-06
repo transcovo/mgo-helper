@@ -1,6 +1,7 @@
 package mongo
 
 import (
+	"context"
 	"time"
 
 	mgo "gopkg.in/mgo.v2"
@@ -17,25 +18,33 @@ type Configuration struct {
 }
 
 /*
-InitMongoFromConfig setups a DB instance based on the viper config.
+InitMongoFromConfig setups a DB instance based on the config.
 It also sets a session ping checker to crash the process if the ping fails.
 Aim: let the server/worker restart in case of a mongo stepdown for instance, so it can recover properly.
-
 */
 func InitMongoFromConfig(config Configuration) (*mgo.Database, func()) {
-	session := Dial(
+	ctx := context.Background()
+	return initWithContext(ctx, config)
+}
+
+func initWithContext(ctx context.Context, config Configuration) (*mgo.Database, func()) {
+	cancelCtx, cancel := context.WithCancel(ctx)
+	session := dial(
 		config.UseSSL,
 		config.URL,
 		config.SSLCert,
 	)
-	pingSession(session, config.PingFrequency)
+	pingSession(cancelCtx, session, config.PingFrequency)
 	db := session.DB("") // use database name from URL
-	teardown := session.Close
+	teardown := func() {
+		cancel()
+		session.Close()
+	}
 	return db, teardown
 }
 
-func pingSession(session *mgo.Session, frequency time.Duration) {
+func pingSession(ctx context.Context, session *mgo.Session, frequency time.Duration) {
 	frequency = time.Millisecond * frequency
-	checker := CreateMongoSessionPinger(session, frequency)
-	checker.Listen()
+	checker := createMongoSessionPinger(session, frequency)
+	checker.Listen(ctx)
 }

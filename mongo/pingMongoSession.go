@@ -1,7 +1,9 @@
 package mongo
 
 import (
+	"context"
 	"io"
+	"sync"
 	"time"
 
 	"github.com/sirupsen/logrus"
@@ -9,14 +11,6 @@ import (
 	"github.com/transcovo/go-chpr-metrics"
 	mgo "gopkg.in/mgo.v2"
 )
-
-/*
-Listener is the interface for the only exposed part of the sessionChecker that is public:
-its Listen function.
-*/
-type Listener interface {
-	Listen()
-}
 
 type pinger interface {
 	Ping() error
@@ -44,10 +38,12 @@ type sessionChecker struct {
 	session      pinger
 	trigger      <-chan time.Time
 	errorHandler errorHandler
+	waitGroup    sync.WaitGroup
 }
 
-func (checker *sessionChecker) Listen() {
+func (checker *sessionChecker) Listen(ctx context.Context) {
 	logger.Info("[mongo.PingMongoSession] Starting ping")
+	checker.waitGroup.Add(1)
 	go func() {
 		defer func() {
 			// This defer is only for testing
@@ -56,10 +52,22 @@ func (checker *sessionChecker) Listen() {
 				logger.WithField("err", r).Error("[mongo.PingMongoSession] Recovered from failing Ping gorountine")
 			}
 		}()
-		for range checker.trigger {
-			checker.checkConnection()
+		defer checker.waitGroup.Done()
+
+	loop:
+		for {
+			select {
+			case <-ctx.Done():
+				break loop
+			case <-checker.trigger:
+				checker.checkConnection()
+			}
 		}
 	}()
+}
+
+func (checker *sessionChecker) wait() {
+	checker.waitGroup.Wait()
 }
 
 func (checker *sessionChecker) checkConnection() {
@@ -82,11 +90,11 @@ func (checker *sessionChecker) crashOnError(err error) {
 }
 
 /*
-CreateMongoSessionPinger creates a Listener based on a mgo session that:
+createMongoSessionPinger creates a Listener based on a mgo session that:
 - regularly pings the DB session
 - in case of an EOF/Unknown error, it exits the process so the server can restart and recover properly
 */
-func CreateMongoSessionPinger(session *mgo.Session, pingInterval time.Duration) Listener {
+func createMongoSessionPinger(session *mgo.Session, pingInterval time.Duration) *sessionChecker {
 	ticker := time.NewTicker(pingInterval)
 	handler := &processQuitter{logger.GetLogger()}
 	checker := &sessionChecker{
